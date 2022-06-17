@@ -10,10 +10,14 @@
 #include <QScreen>
 #include <QVarLengthArray>
 #include <QtCore/private/qsystemerror_p.h>
+#include <QtCore/private/qsystemlibrary_p.h>
+#include <dcomp.h>
 
 QT_BEGIN_NAMESPACE
 
-Q_STATIC_LOGGING_CATEGORY(lcQpaScreenUpdates, "qt.qpa.screen.updates", QtCriticalMsg);
+Q_STATIC_LOGGING_CATEGORY(lcQpaScreenUpdates, "qt.qpa.screen.updates", QtWarningMsg);
+
+using namespace Qt::StringLiterals;
 
 class QDxgiVSyncThread : public QThread
 {
@@ -47,17 +51,47 @@ QDxgiVSyncThread::QDxgiVSyncThread(IDXGIOutput *output, float vsyncIntervalMsRep
 void QDxgiVSyncThread::run()
 {
     qCDebug(lcQpaScreenUpdates) << "QDxgiVSyncThread" << this << "for output" << output << "monitor" << monitor << "entered run()";
+    HANDLE currentThread = ::GetCurrentThread();
+    static const auto pDCompositionWaitForCompositorClock =
+        reinterpret_cast<decltype(&::DCompositionWaitForCompositorClock)>(
+            QApiCache::instance().get(QApiCache::SD_DComp, "DCompositionWaitForCompositorClock"_L1));
     QElapsedTimer timestamp;
     QElapsedTimer elapsed;
     timestamp.start();
     while (!quit.loadAcquire()) {
         elapsed.start();
-        HRESULT hr = output->WaitForVBlank();
-        if (FAILED(hr) || elapsed.nsecsElapsed() <= 1000000) {
+        bool waitSucceeded = false;
+        // Microsoft highly recommends to use the new DCompositionWaitForCompositorClock()
+        // if possible, however, it was introduced in Win 11. And according to my own tests,
+        // this new API doesn't improve much compared to IDXGIOutput::WaitForVBlank().
+        if (pDCompositionWaitForCompositorClock) {
+            static bool informOnce = false;
+            if (!informOnce) {
+                informOnce = true;
+                qCDebug(lcQpaScreenUpdates) << "DCompositionWaitForCompositorClock() is available.";
+            }
+            const DWORD waitResult = pDCompositionWaitForCompositorClock(1, &currentThread, INFINITE);
+            waitSucceeded = waitResult == WAIT_OBJECT_0 + 1;
+            if (!waitSucceeded) {
+                qCWarning(lcQpaScreenUpdates)
+                    << "DCompositionWaitForCompositorClock() failed:" << QSystemError::windowsString();
+            }
+        } else {
+            const HRESULT hr = output->WaitForVBlank();
+            waitSucceeded = SUCCEEDED(hr);
+            if (!waitSucceeded) {
+                qCWarning(lcQpaScreenUpdates)
+                    << "IDXGIOutput::WaitForVBlank() failed:" << QSystemError::windowsComString(hr);
+            }
+        }
+        if (!waitSucceeded || elapsed.nsecsElapsed() <= 1000000) {
             // 1 ms minimum; if less than that was spent in WaitForVBlank
             // (reportedly can happen e.g. when a screen gets powered on/off?),
             // or it reported an error, do a sleep; spinning unthrottled is
             // never acceptable
+            qCWarning(lcQpaScreenUpdates)
+                << "Failed to wait for v-blank. Halting the DXGI v-sync thread for"
+                << vsyncIntervalMsReportedForScreen << "ms.";
             QThread::msleep((unsigned long) vsyncIntervalMsReportedForScreen);
         } else {
             callback(output, monitor, timestamp.nsecsElapsed());
@@ -106,7 +140,7 @@ QDxgiVSyncService::~QDxgiVSyncService()
     // Deadlock is almost guaranteed if we try to clean up here, when the global static is being destructed.
     // Must have been done earlier.
     if (dxgiFactory)
-        qWarning("QDxgiVSyncService not destroyed in time");
+        qCWarning(lcQpaScreenUpdates, "QDxgiVSyncService not destroyed in time");
 }
 
 void QDxgiVSyncService::global_destroy()
@@ -159,7 +193,7 @@ void QDxgiVSyncService::beginFrame(LUID)
     // else, then start from scratch.
 
     if (dxgiFactory && !dxgiFactory->IsCurrent()) {
-        qWarning("QDxgiVSyncService: DXGI Factory is no longer Current");
+        qCWarning(lcQpaScreenUpdates, "QDxgiVSyncService: DXGI Factory is no longer Current");
         QVarLengthArray<LUID, 8> luids;
         for (auto it = adapters.begin(), end = adapters.end(); it != end; ++it)
             luids.append(it->luid);
@@ -182,10 +216,17 @@ void QDxgiVSyncService::refAdapter(LUID luid)
         return;
 
     if (!dxgiFactory) {
-        HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), reinterpret_cast<void **>(&dxgiFactory));
+        static const auto pCreateDXGIFactory2 =
+            reinterpret_cast<decltype(&::CreateDXGIFactory2)>(
+                QApiCache::instance().get(QApiCache::SD_DXGI, "CreateDXGIFactory2"_L1));
+        if (!pCreateDXGIFactory2) {
+            disableService = true;
+            return;
+        }
+        HRESULT hr = pCreateDXGIFactory2(0, IID_PPV_ARGS(&dxgiFactory));
         if (FAILED(hr)) {
             disableService = true;
-            qWarning("QDxgiVSyncService: CreateDXGIFactory2 failed: %s", qPrintable(QSystemError::windowsComString(hr)));
+            qCWarning(lcQpaScreenUpdates, "QDxgiVSyncService: CreateDXGIFactory2 failed: %s", qPrintable(QSystemError::windowsComString(hr)));
             return;
         }
         if (!cleanupRegistered) {
@@ -218,7 +259,7 @@ void QDxgiVSyncService::refAdapter(LUID luid)
     }
 
     if (!a.adapter) {
-        qWarning("VSyncService: Failed to find adapter (via EnumAdapters1), skipping");
+        qCWarning(lcQpaScreenUpdates, "VSyncService: Failed to find adapter (via EnumAdapters1), skipping");
         return;
     }
 
@@ -353,7 +394,7 @@ void QDxgiVSyncService::updateWindowData(QWindow *window, WindowData *wd)
                 }
                 if (!w.isEmpty()) {
 #if 0
-                    qDebug() << "vsync thread" << QThread::currentThread() << monitor << "window list" << w << timestampNs;
+                    qCDebug(lcQpaScreenUpdates) << "vsync thread" << QThread::currentThread() << monitor << "window list" << w << timestampNs;
 #endif
                     for (const Callback &cb : std::as_const(callbacks)) {
                         if (cb)

@@ -49,6 +49,7 @@
 #include <QtCore/qvariant.h>
 
 #include <QtCore/qoperatingsystemversion.h>
+#include <QtCore/private/qsystemlibrary_p.h>
 #include <QtCore/private/qfunctions_win_p.h>
 #include <QtCore/private/qcomptr_p.h>
 
@@ -172,6 +173,8 @@ static inline unsigned parseOptions(const QStringList &paramList,
             options |= QWindowsIntegration::AlwaysUseNativeMenus;
         } else if (param == u"menus=none") {
             options |= QWindowsIntegration::NoNativeMenus;
+        } else if (param == u"nowmpointer") {
+            options |= QWindowsIntegration::DontUseWMPointer;
         } else if (param == u"reverse") {
             options |= QWindowsIntegration::RtlEnabled;
         } else if (param == u"darkmode=0") {
@@ -194,24 +197,40 @@ void QWindowsIntegrationPrivate::parseOptions(QWindowsIntegration *q, const QStr
     initOpenGlBlacklistResources();
 
     static bool dpiAwarenessSet = false;
+    static const bool hasDpiAwarenessContext =
+        QApiCache::instance().get(QApiCache::SD_User32, "SetProcessDpiAwarenessContext"_L1) != nullptr;
     // Default to per-monitor-v2 awareness (if available)
-    QtWindows::DpiAwareness dpiAwareness = QtWindows::DpiAwareness::PerMonitorVersion2;
+    QtWindows::DpiAwareness dpiAwareness = hasDpiAwarenessContext
+            ? QtWindows::DpiAwareness::PerMonitorVersion2
+            : QtWindows::DpiAwareness::PerMonitor;
 
     int tabletAbsoluteRange = -1;
     DarkModeHandling darkModeHandling = DarkModeHandlingFlag::DarkModeWindowFrames
                                       | DarkModeHandlingFlag::DarkModeStyle;
     m_options = ::parseOptions(paramList, &tabletAbsoluteRange, &dpiAwareness, &darkModeHandling);
+    if (!QOperatingSystemVersion::isWin10RS5OrGreater()) {
+        qWarning() << "Qt's global dark mode is only supported on Win10 1809 or greater, "
+                      "it's now disabled due to current platform doesn't support it.";
+        darkModeHandling = {};
+    }
     q->setDarkModeHandling(darkModeHandling);
     QWindowsFontDatabase::setFontOptions(m_options);
     if (tabletAbsoluteRange >= 0)
         QWindowsContext::setTabletAbsoluteRange(tabletAbsoluteRange);
 
-    QCoreApplication::setAttribute(Qt::AA_CompressHighFrequencyEvents);
+    if (m_context.initPointer(m_options))
+        QCoreApplication::setAttribute(Qt::AA_CompressHighFrequencyEvents);
+    else
+        m_context.initTablet();
     QWindowSystemInterfacePrivate::TabletEvent::setPlatformSynthesizesMouse(false);
 
     if (!dpiAwarenessSet) { // Set only once in case of repeated instantiations of QGuiApplication.
         if (!QCoreApplication::testAttribute(Qt::AA_PluginApplication)) {
-            m_context.setProcessDpiAwareness(dpiAwareness);
+            for (auto i = int(dpiAwareness); i > int(QtWindows::DpiAwareness::Invalid); --i) {
+                if (m_context.setProcessDpiAwareness(QtWindows::DpiAwareness(i))) {
+                    break;
+                }
+            }
             qCDebug(lcQpaWindow) << "DpiAwareness=" << dpiAwareness
                 << "effective process DPI awareness=" << QWindowsContext::processDpiAwareness();
         }
@@ -477,19 +496,29 @@ QWindowsStaticOpenGLContext *QWindowsIntegration::staticOpenGLContext()
 
 QPlatformFontDatabase *QWindowsIntegration::fontDatabase() const
 {
-    if (!d->m_fontDatabase) {
+    if (d->m_fontDatabase)
+        return d->m_fontDatabase;
 #ifndef QT_NO_FREETYPE
-        if (d->m_options & QWindowsIntegration::FontDatabaseFreeType)
-            d->m_fontDatabase = new QWindowsFontDatabaseFT;
-        else
+    if (d->m_options & QWindowsIntegration::FontDatabaseFreeType) {
+        d->m_fontDatabase = new QWindowsFontDatabaseFT;
+        return d->m_fontDatabase;
+    }
 #endif // QT_NO_FREETYPE
 #if QT_CONFIG(directwrite3)
-        if (!(d->m_options & (QWindowsIntegration::FontDatabaseGDI | QWindowsIntegration::DontUseDirectWriteFonts)))
+    if (!(d->m_options & (QWindowsIntegration::FontDatabaseGDI | QWindowsIntegration::DontUseDirectWriteFonts))) {
+        if (QOperatingSystemVersion::isWin10RS3OrGreater()) {
             d->m_fontDatabase = new QWindowsDirectWriteFontDatabase;
-        else
-#endif
-            d->m_fontDatabase = new QWindowsFontDatabase;
+            return d->m_fontDatabase;
+        }
+        static bool warnedOnce = false;
+        if (!warnedOnce) {
+            warnedOnce = true;
+            qWarning() << "Qt requires DirectWrite3 to render text, however, current platform doesn't support it."
+                          "\nWe'll fallback to the GDI font engine instead.";
+        }
     }
+#endif
+    d->m_fontDatabase = new QWindowsFontDatabase;
     return d->m_fontDatabase;
 }
 
